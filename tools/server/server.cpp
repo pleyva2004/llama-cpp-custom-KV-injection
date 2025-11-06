@@ -1779,7 +1779,7 @@ struct server_slot {
         }
     };
 
-    token_text_map token_text_map;
+    token_text_map token_map;
 
     size_t last_nl_pos = 0;
 
@@ -5636,7 +5636,7 @@ int main(int argc, char ** argv) {
             branch.text_excerpt = data["text_excerpt"];
             branch.use_text_matching = true;
 
-            auto [start, end] = parent_slot.token_text_map.find_token_range(branch.text_excerpt);
+            auto [start, end] = parent_slot.token_map.find_token_range(branch.text_excerpt);
             if (start == -1) {
                 res_error(res, format_error_response("Text excerpt not found in parent slot", ERROR_TYPE_INVALID_REQUEST));
                 return;
