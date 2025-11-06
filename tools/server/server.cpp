@@ -305,8 +305,8 @@ struct branch_params {
             {"parent_slot_id", parent_slot_id},
             {"token_range_start", token_range_start},
             {"token_range_end", token_range_end},
-            {"mode", mode == BRANCH_MODE_REUSE_KV ? "reuse_kv" : 
-                     mode == BRANCH_MODE_FRESH_CONTEXT ? "fresh" : "hybrid"},
+            {"mode", mode == "reuse_kv" ? BRANCH_MODE_REUSE_KV : 
+                     mode == "fresh" ? BRANCH_MODE_FRESH_CONTEXT : BRANCH_MODE_HYBRID},
             {"text_excerpt", text_excerpt},
             {"use_text_matching", use_text_matching},
             {"context_window", context_window},
@@ -344,7 +344,7 @@ struct server_task {
     std::vector<common_adapter_lora_info> set_lora;
 
     // used by SERVER_TASK_TYPE_BRANCH
-    branch_params branch_params;
+    branch_params branch;
 
     server_task() = default;
 
@@ -1676,6 +1676,7 @@ struct server_prompt_cache {
     }
 };
 
+
 // Modified
 struct server_slot {
     int id;
@@ -2091,6 +2092,7 @@ struct server_slot {
         return res;
     }
 };
+
 
 struct server_metrics {
     int64_t t_start = 0;
@@ -2873,8 +2875,199 @@ struct server_context {
         return res;
     }
 
+
+    bool launch_branch(server_slot & slot, const server_task & task) {
+        const auto & branch_params = task.branch;
+        
+        SLT_DBG(slot, "launching branch from slot %d, range [%d, %d], mode=%d\n", branch_params.parent_slot_id, branch_params.token_range_start, branch_params.token_range_end, branch_params.mode);
+        
+        // Validate parent slot
+        if (branch_params.parent_slot_id < 0 || branch_params.parent_slot_id >= (int)slots.size()) {
+            SLT_ERR(slot, "invalid parent slot ID: %d\n", branch_params.parent_slot_id);
+            send_error(task, "Invalid parent slot ID", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        server_slot & parent_slot = slots[branch_params.parent_slot_id];
+        if (parent_slot.state != SLOT_STATE_DONE_PROMPT) {
+            SLT_ERR(slot, "parent slot %d is not done processing \n", branch_params.parent_slot_id);
+            send_error(task, "Parent slot is not done processing", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+
+        // Determine sequence IDs
+        llama_seq_id parent_seq_id = parent_slot.id;
+        llama_seq_id branch_seq_id = slot.id;
+
+        SLT_DBG(slot, "parent seq_id = %d, branch seq_id = %d\n", parent_seq_id, branch_seq_id);
+
+        switch (branch_params.mode) {
+            case BRANCH_MODE_REUSE_KV:
+
+                /**
+                * REUSE_KV MODE:
+                * - Copies parent's KV cache for token range [start, end)
+                * - New tokens processed in branch's sequence
+                * - Most efficient: no recomputation
+                */
+
+                SLT_INF(slot, "branching in REUSE_KV mode\n");
+
+                auto start = branch_params.token_range_start;
+                auto end = branch_params.token_range_end;
+
+                // Copy KV cache from parent to branch
+                llama_memory * memory = llama_get_memory(ctx);
+                llama_memory_seq_cp(
+                    memory, 
+                    parent_seq_id, 
+                    branch_seq_id, 
+                    start, 
+                    end);
+                
+                SLT_INF(slot, "copied KV cache: seq %d → seq %d, range [%d, %d)\n",
+                    parent_seq_id, branch_seq_id,
+                    start,
+                    end);
+
+
+                slot.n_prompt_tokens_cache = end - start;
+                slot.n_prompt_tokens_processed = slot.n_prompt_tokens_cache;
+
+                if (!parent_slot.token_map.tokens.empty()) {
+
+                    int start_idx = std::max(0, start);
+                    int end_idx = std::min(parent_slot.token_map.tokens.size(), end);
+
+                    slot.cache_tokens.clear();
+
+                    // Copying token IDs from parent to branch
+                    slot.cache_tokens.insert(
+                        slot.cache_tokens.end(),
+                        parent_slot.token_map.tokens.begin() + start_idx,
+                        parent_slot.token_map.tokens.begin() + end_idx
+                    );
+
+                    SLT_DBG(slot, "copied %d tokens from parent to branch\n", end_idx - start_idx);
+                }
+
+                break;
+
+            case BRANCH_MODE_FRESH_CONTEXT:
+
+                /**
+                * FRESH_CONTEXT MODE:
+                * - Clears KV cache for branch sequence
+                * - Re-tokenizes and recomputes selected text
+                * - Provides isolation from parent context
+                * - Slower but useful for "zooming in" without baggage
+                */
+                SLT_INF(slot, "branching in FRESH_CONTEXT mode\n");
+
+                // Clear any exisiting KV For this sequence 
+                llama_memory * memory = llama_get_memory(ctx);
+                llama_memory_seq_rm(memory, branch_seq_id, 0, -1);
+
+               // Extract text from parent's token range
+                std::string context_text;
+                if (!parent_slot.token_map.texts.empty()) {
+                    int start_idx = std::max(0, branch_params.token_range_start);
+                    int end_idx = std::min(
+                        (int)parent_slot.token_map.texts.size(),
+                        branch_params.token_range_end
+                    );
+                    
+                    for (int i = start_idx; i < end_idx; ++i) {
+                        context_text += parent_slot.token_map.texts[i];
+                    }
+                } 
+
+                SLT_DBG(slot, "extracted context text: %zu bytes\n", context_text.size());
+
+
+                // Apply context window limiting if specified
+                if (branch_params.context_window > 0) {
+                    // Tokenize and keep only last N tokens
+                    auto context_tokens = tokenize_mixed(vocab, {context_text}, false, true);
+                    if (context_tokens.size() > (size_t)branch_params.context_window) {
+                        int skip = context_tokens.size() - branch_params.context_window;
+                        context_tokens.erase(
+                            context_tokens.begin(),
+                            context_tokens.begin() + skip
+                        );
+                        
+                        // Reconstruct text from limited tokens
+                        context_text.clear();
+                        for (auto tok : context_tokens) {
+                            context_text += common_token_to_piece(ctx, tok);
+                        }
+                    }
+                    
+                    SLT_INF(slot, "limited context to window of %d tokens\n",
+                            branch_params.context_window);
+                }
+
+
+                // Prepend context to new prompt
+                std::string full_prompt = context_text + "\n\n" + 
+                detokenize_tokens(task.tokens);
+
+                // Tokenize combined prompt
+                slot.cache_tokens = tokenize_mixed(vocab, {full_prompt}, true, true);
+                slot.n_prompt_tokens_cache = 0;  
+                slot.n_prompt_tokens_processed = 0;
+
+                SLT_INF(slot, "fresh context: %d tokens to process\n",(int)slot.cache_tokens.size());
+
+                break;
+
+            case BRANCH_MODE_HYBRID:
+                break;
+        }
+
+
+        // Record branch metadata
+        slot.branch.is_branch = true;
+        slot.branch.parent_slot_id = branch_params.parent_slot_id;
+        slot.branch.branch_point = branch_params.token_range_end;
+        slot.branch.seq_id_parent = parent_seq_id;
+        slot.branch.branch_id = "branch_" + std::to_string(slot.id) + "_" + std::to_string(std::time(nullptr));
+
+        SLT_INF(slot, "branch created: %s\n", slot.branch.branch_id.c_str());
+
+
+        // Set up stabdard slot parameters 
+        slot.params = task.params;
+        slot.state = SLOT_STATE_STARTED;
+        slot.t_last_used = ggml_time_us();
+
+
+        // Add new prompt token
+        slot.cache_tokens.insert(
+            slot.cache_tokens.end(),
+            task.tokens.begin(),
+            task.tokens.end()
+        );
+
+        // Reset decoded and remaining tokens
+        slot.n_decoded = 0;
+        slot.n_remaining = task.params.n_predict;
+
+        SLT_INF(slot, "branch ready to generate: %d remaining tokens\n", slot.n_remaining);
+
+        return true;
+
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.reset();
+
+        slot.task = std::make_unique<const server_task>(std::move(task));
+
+        if (task.type == SERVER_TASK_TYPE_BRANCH) {
+            return launch_branch(slot, task);
+        }
+
 
         if (!are_lora_equal(task.params.lora, slot.lora)) {
             // if lora has changed, check to see if the cache should be cleared
@@ -2962,8 +3155,6 @@ struct server_context {
 
             slot.batch_spec = llama_batch_init(task.params.speculative.n_max + 1, 0, 1);
         }
-
-        slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = SLOT_STATE_STARTED;
 
@@ -5365,6 +5556,150 @@ int main(int argc, char ** argv) {
             ctx_server.oai_parser_opt,
             files);
         res_ok(res, {{ "prompt", std::move(data.at("prompt")) }});
+    };
+
+
+    /**
+    * POST /v1/chat/branch
+    * 
+    * Creates a new conversation branch from an existing slot
+    * 
+    * Request body:
+    * {
+    *   "parent_slot_id": 0,              // Which conversation to branch from
+    *   "branch_mode": "reuse_kv",        // "reuse_kv" | "fresh" | "hybrid"
+    *   "token_range": [10, 50],          // Optional: specific token range
+    *   "text_excerpt": "quantum physics", // Optional: branch from this text
+    *   "context_window": 20,              // Optional: limit context size
+    *   "prompt": "Now explain qubits",   // New prompt for the branch
+    *   // ... standard completion params (temperature, max_tokens, etc.)
+    * }
+    */
+
+    const auto handle_chat_branch = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+        LOG_DBG("branch request: %s\n", req.body.c_str());
+        json data = json::parse(req.body);
+
+
+        // extract branch parameters
+        branch_params branch;
+        branch.parent_slot_id = json_value(data, "parent_slot_id", -1);
+
+        // Validate parent slot exists and is active
+        if (branch.parent_slot_id < 0 || branch.parent_slot_id >= (int)ctx_server.slots.size() || ctx_server.slots[branch.parent_slot_id].state != SLOT_STATE_DONE_PROMPT) {
+            res_error(res, format_error_response("Parent slot not found or not active", ERROR_TYPE_NOT_FOUND));
+            return;
+        }
+
+        const auto & parent_slot = ctx_server.slots[branch.parent_slot_id];
+        if (parent_slot.state == SLOT_STATE_IDLE) {
+            res_error(res, format_error_response("Parent slot is idle (no conversation to branch from)", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        
+
+        
+        // Parse branch mode
+        std::string mode_str = json_value(data, "branch_mode", std::string("reuse_kv"));
+        if (mode_str == "reuse_kv" || mode_str == "fresh" || mode_str == "hybrid") {
+            branch.mode = mode_str;
+        } else {
+            res_error(res, format_error_response("Invalid mode. Must be: reuse_kv, fresh, or hybrid", ERROR_TYPE_INVALID_REQUEST));
+            return;   
+        }
+
+
+        // Token range (if provided)
+        if (data.contains("token_range") && data["token_range"].is_array()) {
+            auto range = data["token_range"];
+            if (range.size() == 2) {
+                branch.token_range_start = range[0];
+                branch.token_range_end = range[1];
+            } else {
+                res_error(res, format_error_response("Invalid token range. Must be an array of two integers", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+        }
+
+        
+        // Text excerpt (if provided - takes precedence over token range)
+        if (data.contains("text_excerpt") && data["text_excerpt"].is_string()) {
+            branch.text_excerpt = data["text_excerpt"];
+            branch.use_text_matching = true;
+
+            auto [start, end] = parent_slot.token_text_map.find_token_range(branch.text_excerpt);
+            if (start == -1) {
+                res_error(res, format_error_response("Text excerpt not found in parent slot", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            branch.token_range_start = start;
+            branch.token_range_end = end;
+
+        } else {
+            res_error(res, format_error_response("Invalid text excerpt. Must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+
+        // Context window (if provided)
+        if (data.contains("context_window") && data["context_window"].is_number_integer()) {
+            branch.context_window = json_value(body, "context_window", 0);
+        } else {
+            res_error(res, format_error_response("Invalid context window. Must be an integer", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // If no range specified, use entire parent conversation
+        if (branch.token_range_end == -1) {
+            branch.token_range_end = parent_slot.n_prompt_tokens_processed + parent_slot.n_decoded;
+        }
+
+
+        // Create task with standard completion params
+        json completion_data = data;
+        completion_data.erase("parent_slot_id");
+        completion_data.erase("branch_mode"); 
+        completion_data.erase("token_range");
+        completion_data.erase("text_excerpt");
+        completion_data.erase("context_window");
+
+
+        // Parse as standard completion parameters
+        slot_params params = server_task::params_from_json_cmpl(
+            ctx_server.ctx,
+            ctx_server.params,
+            completion_data
+        );
+
+
+        // Build server_tokens from new prompt
+        server_tokens tokens;
+        if (data.contains("prompt")) {
+            std::string prompt = data["prompt"].get<std::string>();
+            tokens = tokenize_mixed(ctx_server.vocab, {prompt}, true, true);
+        } else {
+            res_error(res, format_error_response("Missing required field: prompt (new prompt for branch)", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+
+        // Create branching task
+        server_task task(SERVER_TASK_TYPE_BRANCH);
+        task.params = params;
+        task.tokens = tokens;
+        task.branch = branch;
+
+
+        // Queue task
+        ctx_server.queue_tasks.post(task, false);
+        
+        // Wait for slot assignment (or use async pattern)
+        // For simplicity, return branch initiated response
+        res_ok(res, {
+            {"status", "branch_initiated"},
+            {"branch_params", branch.to_json()},
+            {"message", "Branch creation queued successfully"},
+        });
     };
 
     const auto handle_models = [&params, &ctx_server, &state, &res_ok](const httplib::Request &, httplib::Response & res) {
