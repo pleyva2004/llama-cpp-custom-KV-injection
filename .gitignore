@@ -152,3 +152,8 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+
+
+# Python
+/venv/
+downloadModel.py

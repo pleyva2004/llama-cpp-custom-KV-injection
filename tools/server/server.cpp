@@ -66,6 +66,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_BRANCH, 
     SERVER_TASK_TYPE_SET_LORA,
 };
 
@@ -256,6 +257,57 @@ struct slot_params {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"lora",                      lora},
+        };
+    }
+};
+
+/**
+ * Branch metadata: describes a conversation branch point
+ * 
+ * parent_slot_id: The slot containing the parent conversation
+ * token_range_start: First token index to include in branch (inclusive)
+ * token_range_end: Last token index to include in branch (exclusive)
+ * branch_mode: How to handle the KV cache
+ */
+
+struct branch_params {
+
+    int32_t parent_slot_id = -1;
+    int32_t token_range_start = 0;
+    int32_t token_range_end = -1;
+
+
+    enum branch_mode_type {
+
+        BRANCH_MODE_REUSE_KV,       // Reuse KV cache from parent slot
+        BRANCH_MODE_FRESH_CONTEXT,  // Fresh context w/ minimal KV cache recalculation
+        BRANCH_MODE_HYBRID,         // Reuse KV for prefix, fresh for branch point   
+    
+    };
+
+    // Default mode is to reuse KV cache from parent slot
+    branch_mode_type mode = BRANCH_MODE_REUSE_KV;
+
+    
+    // For text-based branching (user provides text span)
+    std::string text_excerpt;
+    bool use_text_matching = false;  // If true, find tokens by text
+
+    // For isolation: how much context to keep 
+    // 0 = use full range
+    // >0 = last N tokens only
+    int32_t context_window = 0;
+
+    json to_json() const {
+        return json {
+            {"parent_slot_id", parent_slot_id},
+            {"token_range_start", token_range_start},
+            {"token_range_end", token_range_end},
+            {"mode", mode == BRANCH_MODE_REUSE_KV ? "reuse_kv" : 
+                     mode == BRANCH_MODE_FRESH_CONTEXT ? "fresh" : "hybrid"},
+            {"text_excerpt", text_excerpt},
+            {"use_text_matching", use_text_matching},
+            {"context_window", context_window},
         };
     }
 };
