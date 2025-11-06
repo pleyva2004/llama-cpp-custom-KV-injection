@@ -6098,6 +6098,11 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/chat/completions",    handle_chat_completions);
     svr->Post(params.api_prefix + "/v1/chat/completions", handle_chat_completions);
     svr->Post(params.api_prefix + "/api/chat",            handle_chat_completions); // ollama specific endpoint
+
+    svr->Post(params.api_prefix + "/chat/branch",         handle_chat_branch);
+    svr->Post(params.api_prefix + "/v1/chat/branch",      handle_chat_branch);
+    svr->Post(params.api_prefix + "/api/chat/branch",     handle_chat_branch);
+
     svr->Post(params.api_prefix + "/infill",              handle_infill);
     svr->Post(params.api_prefix + "/embedding",           handle_embeddings); // legacy
     svr->Post(params.api_prefix + "/embeddings",          handle_embeddings);
