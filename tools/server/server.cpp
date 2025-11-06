@@ -3171,11 +3171,18 @@ struct server_context {
         clean_kv_cache = false;
     }
 
+    // Modified 
     bool process_token(completion_token_output & result, server_slot & slot) {
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
+        // Track token-to-text mapping
+        slot.token_map.tokens.push_back(result.tok);
+        slot.token_map.texts.push_back(token_str);
+        slot.token_map.positions.push_back(slot.generated_text.size() - token_str.size());
+
+        // Returns tokens back to the user
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
@@ -5576,6 +5583,8 @@ int main(int argc, char ** argv) {
     * }
     */
 
+    
+    // new
     const auto handle_chat_branch = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
         LOG_DBG("branch request: %s\n", req.body.c_str());
         json data = json::parse(req.body);
@@ -5701,6 +5710,30 @@ int main(int argc, char ** argv) {
             {"message", "Branch creation queued successfully"},
         });
     };
+
+
+    // Get branch tree visualization
+    // new
+    const auto handle_branch_tree = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
+        json branches = json::array();
+        
+        // Build branch tree from all active slots
+        for (const auto & slot : ctx_server.slots) {
+            if (slot.state != SLOT_STATE_IDLE && slot.branch.is_branch) {
+                branches.push_back({
+                    {"slot_id", slot.id},
+                    {"branch_id", slot.branch.branch_id},
+                    {"parent_slot_id", slot.branch.parent_slot_id},
+                    {"branch_point", slot.branch.branch_point},
+                    {"n_tokens", slot.n_prompt_tokens_processed + slot.n_decoded},
+                    {"state", slot_state_to_str(slot.state)},
+                });
+            }
+        }
+        
+        res_ok(res, {{"branches", branches}});
+    };
+
 
     const auto handle_models = [&params, &ctx_server, &state, &res_ok](const httplib::Request &, httplib::Response & res) {
         server_state current_state = state.load();
@@ -6120,6 +6153,9 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get (params.api_prefix + "/slots",               handle_slots);
     svr->Post(params.api_prefix + "/slots/:id_slot",      handle_slots_action);
+
+    // Branch tree visualization
+    svr->Get(params.api_prefix + "/branch/tree", handle_branch_tree);
 
     //
     // Start the server
