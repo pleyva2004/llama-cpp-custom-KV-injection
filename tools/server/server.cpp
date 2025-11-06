@@ -305,8 +305,8 @@ struct branch_params {
             {"parent_slot_id", parent_slot_id},
             {"token_range_start", token_range_start},
             {"token_range_end", token_range_end},
-            {"mode", mode == "reuse_kv" ? BRANCH_MODE_REUSE_KV : 
-                     mode == "fresh" ? BRANCH_MODE_FRESH_CONTEXT : BRANCH_MODE_HYBRID},
+            {"mode", mode == BRANCH_MODE_REUSE_KV ? "reuse_kv" : 
+                     mode == BRANCH_MODE_FRESH_CONTEXT ? "fresh" : "hybrid"},
             {"text_excerpt", text_excerpt},
             {"use_text_matching", use_text_matching},
             {"context_window", context_window},
