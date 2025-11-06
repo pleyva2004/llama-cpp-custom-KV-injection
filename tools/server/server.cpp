@@ -1770,7 +1770,7 @@ struct server_slot {
                 if (start_tok == -1 && positions[i] >= (int32_t)pos) {
                     start_tok = i;
                 }
-                if (positions[i] >= (int32_t)(pos + excerpt.length())) {
+                if (positions[i] >= (int32_t)(pos + text.length())) {
                     end_tok = i;
                     break;
                 }
