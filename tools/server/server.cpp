@@ -340,6 +340,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::vector<common_adapter_lora_info> set_lora;
 
+    // used by SERVER_TASK_TYPE_BRANCH
+    branch_params branch_params;
+
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
