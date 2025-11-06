@@ -55,6 +55,7 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
+// Modified
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
     SERVER_TASK_TYPE_EMBEDDING,
@@ -270,6 +271,7 @@ struct slot_params {
  * branch_mode: How to handle the KV cache
  */
 
+// New
 struct branch_params {
 
     int32_t parent_slot_id = -1;
@@ -312,6 +314,7 @@ struct branch_params {
     }
 };
 
+// Modified
 struct server_task {
     int id    = -1; // to be filled by server_queue
     int index = -1; // used when there are multiple prompts (batch request)
@@ -1673,6 +1676,7 @@ struct server_prompt_cache {
     }
 };
 
+// Modified
 struct server_slot {
     int id;
 
@@ -1702,6 +1706,79 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+
+
+    // branch tracking
+    struct branch_info {
+
+        // is this slot a branch?
+        bool is_branch = false;
+
+        //Parents slot ID
+        int32_t parent_slot_id = -1;
+        
+        // Token position where branch occured
+        int32_t branch_point = -1;
+
+        // Sequence ID of the parent slot
+        int32_t seq_id_parent = -1;
+
+        // Unique ID for this branch
+        std::string branch_id;
+
+        json to_json() const {
+            return json {
+                { "is_branch", is_branch },
+                { "parent_slot_id", parent_slot_id },
+                { "branch_point", branch_point },
+                { "branch_id", branch_id },
+            };
+        }
+    };
+
+    branch_info branch_info;
+
+    // Track token to text mapping for text-based branching
+    struct token_text_map {
+
+        // Token representation of all the text in the slot
+        std::vector<llama_token> tokens;
+        
+        // Decoded text for each token
+        std::vector<std::string> texts;  
+        
+        // Character position in full text
+        std::vector<int32_t> positions;  
+
+        // Find token range for a text excerpt
+        std::pair<int32_t, int32_t> find_token_range(const std::string & text) const {
+
+            // Collect all text into a single string
+            std::string full_text;
+            for (const auto & text : texts) {
+                full_text += text;
+            }
+
+            size_t pos = full_text.find(text);
+            if (pos == std::string::npos) {
+                return {-1, -1}; // Not found
+            }
+
+            int32_t start_tok = - 1, end_tok = -1;
+            for (int32_t i = 0; i < tokens.size(); i++) {
+                if (start_tok == -1 && positions[i] >= (int32_t)pos) {
+                    start_tok = i;
+                }
+                if (positions[i] >= (int32_t)(pos + excerpt.length())) {
+                    end_tok = i;
+                    break;
+                }
+            }
+            return {start_tok, end_tok == -1 ? (int32_t)tokens.size() : end_tok};
+        }
+    };
+
+    token_text_map token_text_map;
 
     size_t last_nl_pos = 0;
 
