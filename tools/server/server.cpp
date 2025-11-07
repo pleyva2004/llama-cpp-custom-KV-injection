@@ -2760,11 +2760,23 @@ struct server_context {
 
         bool update_cache = false;
 
+        // For branch tasks, we must exclude the parent slot to avoid seq_id collision
+        int parent_slot_id = -1;
+        if (task.type == SERVER_TASK_TYPE_BRANCH && task.branch.parent_slot_id >= 0) {
+            parent_slot_id = task.branch.parent_slot_id;
+        }
+
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
+                // CRITICAL: skip the parent slot if this is a branch operation
+                // to avoid copying KV cache from seq N to seq N (would be a no-op/corruption)
+                if (parent_slot_id >= 0 && slot.id == parent_slot_id) {
+                    continue;
+                }
+
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
@@ -2806,6 +2818,11 @@ struct server_context {
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
+                // CRITICAL: skip the parent slot if this is a branch operation
+                if (parent_slot_id >= 0 && slot.id == parent_slot_id) {
+                    continue;
+                }
+
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
@@ -2903,9 +2920,21 @@ struct server_context {
         }
 
         server_slot & parent_slot = slots[branch_params.parent_slot_id];
-        if (parent_slot.state != SLOT_STATE_DONE_PROMPT) {
-            SLT_ERR(slot, "parent slot %d is not done processing \n", branch_params.parent_slot_id);
-            send_error(task, "Parent slot is not done processing", ERROR_TYPE_INVALID_REQUEST);
+        
+        // Check if parent slot has completed its generation
+        // IMPORTANT: We only allow branching from IDLE slots to avoid race conditions
+        // when accessing the KV cache. Branching from GENERATING slots could cause
+        // concurrent access issues.
+        if (parent_slot.state != SLOT_STATE_IDLE) {
+            SLT_ERR(slot, "parent slot %d is not idle (state=%d), cannot branch\n", branch_params.parent_slot_id, parent_slot.state);
+            send_error(task, "Parent slot must be idle before branching. Please wait for the generation to complete.", ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        
+        // Ensure parent slot has some tokens to branch from
+        if (parent_slot.n_prompt_tokens_processed == 0 && parent_slot.n_decoded == 0) {
+            SLT_ERR(slot, "parent slot %d has no tokens to branch from\n", branch_params.parent_slot_id);
+            send_error(task, "Parent slot has no conversation to branch from", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
 
@@ -2979,9 +3008,19 @@ struct server_context {
                 */
                 SLT_INF(slot, "branching in FRESH_CONTEXT mode%s\n", "");
 
-                // Clear any existing KV For this sequence 
+                // Clear any existing KV cache for this sequence 
                 auto memory = llama_get_memory(ctx);
                 llama_memory_seq_rm(memory, branch_seq_id, 0, -1);
+                
+                // CRITICAL: Clear the slot's prompt cache state to avoid assertion errors
+                // When we cleared the KV cache above, we must also clear ALL the slot's tracking
+                // of cached/processed tokens, otherwise n_past will be inconsistent with pos_min
+                slot.prompt.tokens.clear();
+                slot.prompt.data.clear();              // Clear cached prompt state
+                slot.prompt.checkpoints.clear();       // Clear prompt checkpoints
+                slot.token_map.tokens.clear();
+                slot.token_map.texts.clear();
+                slot.token_map.positions.clear();
 
                // Extract text from parent's token range
                 std::string context_text;
@@ -3071,26 +3110,58 @@ struct server_context {
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         slot.reset();
 
+        std::cout << "launch_slot_with_task: " << task.type << std::endl;
+        const bool is_branch = task.type == SERVER_TASK_TYPE_BRANCH;
+        
         slot.task = std::make_unique<const server_task>(std::move(task));
 
-        if (task.type == SERVER_TASK_TYPE_BRANCH) {
-            return launch_branch(slot, task);
+        // Common initialization for ALL task types (branch and completion)
+        // This must happen BEFORE launch_branch because generation needs these
+        
+        // Token validation
+        if (!slot.task->tokens.validate(ctx)) {
+            send_error(*slot.task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+            return false;
         }
 
+        // Initialize samplers (CRITICAL for generation!)
+        {
+            if (slot.smpl != nullptr) {
+                common_sampler_free(slot.smpl);
+            }
 
-        if (!are_lora_equal(task.params.lora, slot.lora)) {
+            slot.smpl = common_sampler_init(model, slot.task->params.sampling);
+            if (slot.smpl == nullptr) {
+                send_error(*slot.task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
+        // Initialize draft batch for speculative decoding
+        if (slot.ctx_dft) {
+            llama_batch_free(slot.batch_spec);
+            slot.batch_spec = llama_batch_init(slot.task->params.speculative.n_max + 1, 0, 1);
+        }
+
+        // Branch-specific setup (KV cache copying, etc.)
+        if (is_branch) {
+            return launch_branch(slot, *slot.task);
+        }
+    
+
+        if (!are_lora_equal(slot.task->params.lora, slot.lora)) {
             // if lora has changed, check to see if the cache should be cleared
-            if (lora_should_clear_cache(slot.lora, task.params.lora)) {
-                SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
+            if (lora_should_clear_cache(slot.lora, slot.task->params.lora)) {
+                SLT_INF(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), slot.task->params.lora.size());
                 slot.prompt.tokens.clear();
             } else {
-                SLT_INF(slot, "keeping cache for alora. %zu target loras\n", task.params.lora.size());
+                SLT_INF(slot, "keeping cache for alora. %zu target loras\n", slot.task->params.lora.size());
             }
-            slot.lora = task.params.lora;
+            slot.lora = slot.task->params.lora;
         }
 
         // if using alora, make sure it's only a single one requested and active
-        size_t alora_invocation_start = task.tokens.size();
+        size_t alora_invocation_start = slot.task->tokens.size();
         if (lora_all_alora(slot.lora)) {
             const auto & enabled_ids = lora_get_enabled_ids(slot.lora);
             // TODO: This will error out if a user requests two aloras, but only
@@ -3098,7 +3169,7 @@ struct server_context {
             // for all requested alora activation strings and then either keep
             // only the last one, or reject if multiple are found.
             if (enabled_ids.size() != 1) {
-                send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
+                send_error(*slot.task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
             const auto & lora = slot.lora[enabled_ids[0]].ptr;
@@ -3110,10 +3181,10 @@ struct server_context {
             // scan backwards through the prompt tokens to find the last
             // occurrence of the invocation sequence
             int match_idx = static_cast<int>(n_invocation_tokens) - 1;
-            for (int i = task.tokens.size() - 1; i >= 0; --i) {
+            for (int i = slot.task->tokens.size() - 1; i >= 0; --i) {
                 // the token in this position matches the next token to find in
                 // the invocation sequence
-                if (task.tokens[i] == invocation_tokens[match_idx]) {
+                if (slot.task->tokens[i] == invocation_tokens[match_idx]) {
                     // if it's a full match, we've found the start
                     if (match_idx == 0) {
                         alora_invocation_start = i;
@@ -3128,7 +3199,7 @@ struct server_context {
             }
 
             // if the activation string is not found, disable the alora
-            if (alora_invocation_start == task.tokens.size()) {
+            if (alora_invocation_start == slot.task->tokens.size()) {
                 SLT_DBG(slot, "alora %zu requested, but not found. deactivating\n", enabled_ids[0]);
                 slot.lora[enabled_ids[0]].scale = 0.0f;
             } else {
@@ -3137,33 +3208,7 @@ struct server_context {
             }
         }
 
-        if (!task.tokens.validate(ctx)) {
-            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
-            return false;
-        }
-
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
-
-        // initialize samplers
-        {
-            if (slot.smpl != nullptr) {
-                common_sampler_free(slot.smpl);
-            }
-
-            slot.smpl = common_sampler_init(model, task.params.sampling);
-            if (slot.smpl == nullptr) {
-                // for now, the only error that may happen here is invalid grammar
-                send_error(task, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-        }
-
-        // initialize draft batch
-        if (slot.ctx_dft) {
-            llama_batch_free(slot.batch_spec);
-
-            slot.batch_spec = llama_batch_init(task.params.speculative.n_max + 1, 0, 1);
-        }
 
         slot.state = SLOT_STATE_STARTED;
 
@@ -3687,20 +3732,20 @@ struct server_context {
 
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", task.id);
+                        std::cout << "no slot is available, defer task, id_task = " << task.id << std::endl;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     if (slot->is_processing()) {
                         // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        std::cout << "requested slot is unavailable, defer task, id_task = " << task.id << std::endl;
                         queue_tasks.defer(std::move(task));
                         break;
                     }
 
                     if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", task.id);
+                        std::cout << "failed to launch slot with task, id_task = " << task.id << std::endl;
                         break;
                     }
                 } break;
@@ -5597,7 +5642,14 @@ int main(int argc, char ** argv) {
     // new
     const auto handle_chat_branch = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
         LOG_DBG("branch request: %s\n", req.body.c_str());
-        json data = json::parse(req.body);
+        
+        json data;
+        try {
+            data = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res_error(res, format_error_response(std::string("Invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
 
 
         // extract branch parameters
@@ -5605,16 +5657,16 @@ int main(int argc, char ** argv) {
         branch.parent_slot_id = json_value(data, "parent_slot_id", -1);
 
         // Validate parent slot exists and is active
-        if (branch.parent_slot_id < 0 || branch.parent_slot_id >= (int)ctx_server.slots.size() || ctx_server.slots[branch.parent_slot_id].state != SLOT_STATE_DONE_PROMPT) {
-            res_error(res, format_error_response("Parent slot not found or not active", ERROR_TYPE_NOT_FOUND));
-            return;
-        }
+        // if (branch.parent_slot_id < 0 || branch.parent_slot_id >= (int)ctx_server.slots.size() || ctx_server.slots[branch.parent_slot_id].state != SLOT_STATE_DONE_PROMPT) {
+        //     res_error(res, format_error_response("Parent slot not found or not active", ERROR_TYPE_NOT_FOUND));
+        //     return;
+        // }
 
         const auto & parent_slot = ctx_server.slots[branch.parent_slot_id];
-        if (parent_slot.state == SLOT_STATE_IDLE) {
-            res_error(res, format_error_response("Parent slot is idle (no conversation to branch from)", ERROR_TYPE_INVALID_REQUEST));
-            return;
-        }
+        // if (parent_slot.state == SLOT_STATE_IDLE) {
+        //     res_error(res, format_error_response("Parent slot is idle (no conversation to branch from)", ERROR_TYPE_INVALID_REQUEST));
+        //     return;
+        // }
         
 
         
@@ -5647,9 +5699,7 @@ int main(int argc, char ** argv) {
         if (data.contains("text_excerpt") && data["text_excerpt"].is_string()) {
             branch.text_excerpt = data["text_excerpt"];
             branch.use_text_matching = true;
-            
-
-       
+        
 
             std::cout << "=== DEBUG find_token_range ===" << std::endl;
             std::cout << "text_excerpt: '" << branch.text_excerpt << "'" << std::endl;
@@ -5716,22 +5766,80 @@ int main(int argc, char ** argv) {
 
 
         // Create branching task
-        server_task task(SERVER_TASK_TYPE_BRANCH);
+        server_task task = server_task(SERVER_TASK_TYPE_BRANCH);
+        task.id = ctx_server.queue_tasks.get_new_id();
         task.params = params;
         task.tokens = std::move(tokens);
         task.branch = branch;
-
-
-        // Queue task
-        ctx_server.queue_tasks.post(std::move(task), false);
         
-        // Wait for slot assignment (or use async pattern)
-        // For simplicity, return branch initiated response
-        res_ok(res, {
-            {"status", "branch_initiated"},
-            {"branch_params", branch.to_json()},
-            {"message", "Branch creation queued successfully"},
-        });
+        // Set OAI-compat chat format for proper streaming response format
+        auto completion_id = gen_chatcmplid();
+        task.params.oaicompat = OAICOMPAT_TYPE_CHAT;
+        task.params.oaicompat_cmpl_id = completion_id;
+
+        // Handle results like completions do
+        std::unordered_set<int> task_ids = {task.id};
+        bool stream = json_value(data, "stream", false);
+        
+        ctx_server.queue_results.add_waiting_task_id(task.id);
+        ctx_server.queue_tasks.post(std::move(task), false);
+
+        if (!stream) {
+            // Non-streaming: wait for final result and return it
+            ctx_server.receive_multi_results(task_ids, 
+                [&](std::vector<server_task_result_ptr> & results) {
+                    res_ok(res, results[0]->to_json());
+                }, 
+                [&](const json & error_data) {
+                    res_error(res, error_data);
+                }, 
+                req.is_connection_closed);
+            
+            ctx_server.queue_results.remove_waiting_task_ids(task_ids);
+        } else {
+            // Streaming: set up chunked content provider
+            const auto chunked_content_provider = [task_ids, &ctx_server](
+                size_t, httplib::DataSink & sink) {
+                
+                ctx_server.receive_cmpl_results_stream(task_ids, 
+                    [&](server_task_result_ptr & result) -> bool {
+                        json res_json = result->to_json();
+                        if (res_json.is_array()) {
+                            for (const auto & res : res_json) {
+                                if (!server_sent_event(sink, res)) {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        } else {
+                            return server_sent_event(sink, res_json);
+                        }
+                    }, 
+                    [&](const json & error_data) {
+                        // Send error in OpenAI-compatible streaming format
+                        json error_chunk = {
+                            {"choices", json::array()},
+                            {"error", error_data}
+                        };
+                        server_sent_event(sink, error_chunk);
+                    }, 
+                    [&sink]() {
+                        return !sink.is_writable();
+                    });
+                
+                static const std::string ev_done = "data: [DONE]\n\n";
+                sink.write(ev_done.data(), ev_done.size());
+                sink.done();
+                return false;
+            };
+
+            auto on_complete = [task_ids, &ctx_server](bool) {
+                ctx_server.queue_results.remove_waiting_task_ids(task_ids);
+            };
+
+            res.set_chunked_content_provider("text/event-stream", 
+                chunked_content_provider, on_complete);
+        }
     };
 
     const auto handle_chat_branch2 = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
