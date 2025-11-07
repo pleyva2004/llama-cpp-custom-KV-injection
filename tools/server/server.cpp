@@ -1737,7 +1737,7 @@ struct server_slot {
         }
     };
 
-    branch_info branch_info;
+    branch_info branch;
 
     // Track token to text mapping for text-based branching
     struct token_text_map {
@@ -2902,8 +2902,7 @@ struct server_context {
         SLT_DBG(slot, "parent seq_id = %d, branch seq_id = %d\n", parent_seq_id, branch_seq_id);
 
         switch (branch_params.mode) {
-            case BRANCH_MODE_REUSE_KV:
-
+            case branch_params::BRANCH_MODE_REUSE_KV:{
                 /**
                 * REUSE_KV MODE:
                 * - Copies parent's KV cache for token range [start, end)
@@ -2952,8 +2951,8 @@ struct server_context {
                 }
 
                 break;
-
-            case BRANCH_MODE_FRESH_CONTEXT:
+            }
+            case branch_params::BRANCH_MODE_FRESH_CONTEXT:{
 
                 /**
                 * FRESH_CONTEXT MODE:
@@ -3010,7 +3009,7 @@ struct server_context {
 
                 // Prepend context to new prompt
                 std::string full_prompt = context_text + "\n\n" + 
-                detokenize_tokens(task.tokens);
+                task.tokens.detokenize(ctx, true)
 
                 // Tokenize combined prompt
                 slot.cache_tokens = tokenize_mixed(vocab, {full_prompt}, true, true);
@@ -3020,9 +3019,7 @@ struct server_context {
                 SLT_INF(slot, "fresh context: %d tokens to process\n",(int)slot.cache_tokens.size());
 
                 break;
-
-            case BRANCH_MODE_HYBRID:
-                break;
+            }
         }
 
 
