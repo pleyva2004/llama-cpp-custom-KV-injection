@@ -1000,6 +1000,7 @@ struct server_task_result_cmpl_final : server_task_result {
             res.push_back({"timings", timings.to_json()});
         }
 
+        res["slot_id"] = id_slot;
         return res;
     }
 
@@ -1752,29 +1753,43 @@ struct server_slot {
 
         // Find token range for a text excerpt
         std::pair<int32_t, int32_t> find_token_range(const std::string & text) const {
-
             // Collect all text into a single string
             std::string full_text;
-            for (const auto & text : texts) {
-                full_text += text;
+            for (const auto & token_text : texts) {  // Fix: renamed to avoid shadowing
+                full_text += token_text;
             }
-
+        
             size_t pos = full_text.find(text);
             if (pos == std::string::npos) {
                 return {-1, -1}; // Not found
             }
-
-            int32_t start_tok = - 1, end_tok = -1;
-            for (int32_t i = 0; i < tokens.size(); i++) {
-                if (start_tok == -1 && positions[i] >= (int32_t)pos) {
+        
+            int32_t start_tok = -1, end_tok = -1;
+            
+            // Find the token that contains the start of the excerpt
+            for (int32_t i = 0; i < (int32_t)tokens.size(); i++) {
+                size_t token_end_pos = (i + 1 < (int32_t)positions.size()) 
+                    ? positions[i + 1] 
+                    : full_text.size();
+                
+                // Token i spans from positions[i] to token_end_pos
+                if (start_tok == -1 && positions[i] <= pos && pos < token_end_pos) {
                     start_tok = i;
                 }
+                
+                // Find token that contains or follows the end of the excerpt
                 if (positions[i] >= (int32_t)(pos + text.length())) {
                     end_tok = i;
                     break;
                 }
             }
-            return {start_tok, end_tok == -1 ? (int32_t)tokens.size() : end_tok};
+            
+            // If we found the start but not the end, the excerpt extends to the last token
+            if (start_tok != -1 && end_tok == -1) {
+                end_tok = (int32_t)tokens.size();
+            }
+            
+            return {start_tok, end_tok};
         }
     };
 
@@ -5632,8 +5647,19 @@ int main(int argc, char ** argv) {
         if (data.contains("text_excerpt") && data["text_excerpt"].is_string()) {
             branch.text_excerpt = data["text_excerpt"];
             branch.use_text_matching = true;
+            
+
+       
+
+            std::cout << "=== DEBUG find_token_range ===" << std::endl;
+            std::cout << "text_excerpt: '" << branch.text_excerpt << "'" << std::endl;
+            std::cout << "token_map size: " << parent_slot.token_map.tokens.size() << std::endl;
+            std::cout << "Full generated text: '" << parent_slot.generated_text << "'" << std::endl;
 
             auto [start, end] = parent_slot.token_map.find_token_range(branch.text_excerpt);
+            std::cout << "Found range: [" << start << ", " << end << "]" << std::endl;
+
+
             if (start == -1) {
                 res_error(res, format_error_response("Text excerpt not found in parent slot", ERROR_TYPE_INVALID_REQUEST));
                 return;
@@ -5650,7 +5676,7 @@ int main(int argc, char ** argv) {
         // Context window (if provided)
         if (data.contains("context_window") && data["context_window"].is_number_integer()) {
             branch.context_window = json_value(data, "context_window", 0);
-        } else {
+        } else if (data.contains("context_window") && !data["context_window"].is_number_integer()) {
             res_error(res, format_error_response("Invalid context window. Must be an integer", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
@@ -5708,6 +5734,40 @@ int main(int argc, char ** argv) {
         });
     };
 
+    const auto handle_chat_branch2 = [&ctx_server, &res_error, &res_ok](const httplib::Request & req, httplib::Response & res) {
+
+        json data = json::parse(req.body);
+        std::cout << "branch request: " << data.dump() << std::endl;
+
+       // extract branch parameters
+       branch_params branch;
+       branch.parent_slot_id = json_value(data, "parent_slot_id", -1);
+
+    //    // Validate parent slot exists and is active
+    //    if (branch.parent_slot_id < 0 || branch.parent_slot_id >= (int)ctx_server.slots.size() || ctx_server.slots[branch.parent_slot_id].state != SLOT_STATE_DONE_PROMPT) {
+    //        res_error(res, format_error_response("Parent slot not found or not active", ERROR_TYPE_NOT_FOUND));
+    //        return;
+    //    }
+
+    //    const auto & parent_slot = ctx_server.slots[branch.parent_slot_id];
+    //    if (parent_slot.state == SLOT_STATE_IDLE) {
+    //        res_error(res, format_error_response("Parent slot is idle (no conversation to branch from)", ERROR_TYPE_INVALID_REQUEST));
+    //        return;
+    //    }
+       
+       // Parse branch mode
+       std::string mode_str = json_value(data, "branch_mode", std::string("reuse_kv"));
+       if (mode_str == "reuse_kv" ) {
+           branch.mode = branch_params::BRANCH_MODE_REUSE_KV;
+       } else if (mode_str == "fresh") {
+           branch.mode = branch_params::BRANCH_MODE_FRESH_CONTEXT;
+       } else {
+           res_error(res, format_error_response("Invalid mode. Must be: reuse_kv or fresh", ERROR_TYPE_INVALID_REQUEST));
+           return;   
+       } 
+
+       return res_ok(res, {{"status", "ok"}});
+    };
 
     // Get branch tree visualization
     // new
@@ -5729,6 +5789,15 @@ int main(int argc, char ** argv) {
         }
         
         res_ok(res, {{"branches", branches}});
+    };
+
+    const auto handle_branch_health = [&](const httplib::Request &, httplib::Response & res) {
+
+
+        std::cout << "branch health" << std::endl;
+
+        json health = {{"status", "ok"}};
+        return res_ok(res, health);
     };
 
 
@@ -6152,7 +6221,8 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/slots/:id_slot",      handle_slots_action);
 
     // Branch tree visualization
-    svr->Get(params.api_prefix + "/branch/tree", handle_branch_tree);
+    svr->Get(params.api_prefix + "/branch/tree",          handle_branch_tree);
+    svr->Get(params.api_prefix + "/branch/health",        handle_branch_health);
 
     //
     // Start the server
