@@ -2902,7 +2902,8 @@ struct server_context {
         SLT_DBG(slot, "parent seq_id = %d, branch seq_id = %d\n", parent_seq_id, branch_seq_id);
 
         switch (branch_params.mode) {
-            case branch_params::BRANCH_MODE_REUSE_KV:{
+            case branch_params::BRANCH_MODE_REUSE_KV: {
+
                 /**
                 * REUSE_KV MODE:
                 * - Copies parent's KV cache for token range [start, end)
@@ -2916,7 +2917,7 @@ struct server_context {
                 auto end = branch_params.token_range_end;
 
                 // Copy KV cache from parent to branch
-                llama_memory * memory = llama_get_memory(ctx);
+                auto memory = llama_get_memory(ctx);
                 llama_memory_seq_cp(
                     memory, 
                     parent_seq_id, 
@@ -2936,13 +2937,12 @@ struct server_context {
                 if (!parent_slot.token_map.tokens.empty()) {
 
                     int start_idx = std::max(0, start);
-                    int end_idx = std::min(parent_slot.token_map.tokens.size(), end);
+                    int end_idx = std::min((int)parent_slot.token_map.tokens.size(), end);
 
-                    slot.cache_tokens.clear();
+                    slot.prompt.tokens.clear();
 
                     // Copying token IDs from parent to branch
-                    slot.cache_tokens.insert(
-                        slot.cache_tokens.end(),
+                    slot.prompt.tokens.insert(
                         parent_slot.token_map.tokens.begin() + start_idx,
                         parent_slot.token_map.tokens.begin() + end_idx
                     );
@@ -2952,8 +2952,7 @@ struct server_context {
 
                 break;
             }
-            case branch_params::BRANCH_MODE_FRESH_CONTEXT:{
-
+            case branch_params::BRANCH_MODE_FRESH_CONTEXT: {
                 /**
                 * FRESH_CONTEXT MODE:
                 * - Clears KV cache for branch sequence
@@ -2963,8 +2962,8 @@ struct server_context {
                 */
                 SLT_INF(slot, "branching in FRESH_CONTEXT mode\n");
 
-                // Clear any exisiting KV For this sequence 
-                llama_memory * memory = llama_get_memory(ctx);
+                // Clear any existing KV For this sequence 
+                auto memory = llama_get_memory(ctx);
                 llama_memory_seq_rm(memory, branch_seq_id, 0, -1);
 
                // Extract text from parent's token range
@@ -3009,14 +3008,15 @@ struct server_context {
 
                 // Prepend context to new prompt
                 std::string full_prompt = context_text + "\n\n" + 
-                task.tokens.detokenize(ctx, true)
+                    task.tokens.detokenize(ctx, true);
 
                 // Tokenize combined prompt
-                slot.cache_tokens = tokenize_mixed(vocab, {full_prompt}, true, true);
+                auto tokenized = tokenize_mixed(vocab, {full_prompt}, true, true);
+                slot.prompt.tokens = server_tokens(tokenized, false);
                 slot.n_prompt_tokens_cache = 0;  
                 slot.n_prompt_tokens_processed = 0;
 
-                SLT_INF(slot, "fresh context: %d tokens to process\n",(int)slot.cache_tokens.size());
+                SLT_INF(slot, "fresh context: %d tokens to process\n", (int)slot.prompt.tokens.size());
 
                 break;
             }
@@ -3034,14 +3034,12 @@ struct server_context {
 
 
         // Set up stabdard slot parameters 
-        slot.params = task.params;
         slot.state = SLOT_STATE_STARTED;
         slot.t_last_used = ggml_time_us();
 
 
         // Add new prompt token
-        slot.cache_tokens.insert(
-            slot.cache_tokens.end(),
+        slot.prompt.tokens.insert(
             task.tokens.begin(),
             task.tokens.end()
         );
@@ -5607,12 +5605,15 @@ int main(int argc, char ** argv) {
         
         // Parse branch mode
         std::string mode_str = json_value(data, "branch_mode", std::string("reuse_kv"));
-        if (mode_str == "reuse_kv" || mode_str == "fresh" || mode_str == "hybrid") {
-            branch.mode = mode_str;
+        if (mode_str == "reuse_kv"){
+            branch.mode = branch_params::BRANCH_MODE_REUSE_KV;
+        } else if (mode_str == "fresh"){
+            branch.mode = branch_params::BRANCH_MODE_FRESH_CONTEXT;
         } else {
-            res_error(res, format_error_response("Invalid mode. Must be: reuse_kv, fresh, or hybrid", ERROR_TYPE_INVALID_REQUEST));
-            return;   
+            res_error(res, format_error_response("Invalid mode. Must be: reuse_kv or fresh", ERROR_TYPE_INVALID_REQUEST));
+            return;
         }
+
 
 
         // Token range (if provided)
