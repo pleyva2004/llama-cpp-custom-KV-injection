@@ -2911,7 +2911,7 @@ struct server_context {
                 * - Most efficient: no recomputation
                 */
 
-                SLT_INF(slot, "branching in REUSE_KV mode\n");
+                SLT_INF(slot, "branching in REUSE_KV mode%s\n", "");
 
                 auto start = branch_params.token_range_start;
                 auto end = branch_params.token_range_end;
@@ -2960,7 +2960,7 @@ struct server_context {
                 * - Provides isolation from parent context
                 * - Slower but useful for "zooming in" without baggage
                 */
-                SLT_INF(slot, "branching in FRESH_CONTEXT mode\n");
+                SLT_INF(slot, "branching in FRESH_CONTEXT mode\n", "");
 
                 // Clear any existing KV For this sequence 
                 auto memory = llama_get_memory(ctx);
@@ -3039,10 +3039,7 @@ struct server_context {
 
 
         // Add new prompt token
-        slot.prompt.tokens.insert(
-            task.tokens.begin(),
-            task.tokens.end()
-        );
+        slot.prompt.tokens.insert(task.tokens.get_text_tokens());
 
         // Reset decoded and remaining tokens
         slot.n_decoded = 0;
@@ -3665,6 +3662,7 @@ struct server_context {
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_BRANCH:
                 {
                     const int id_slot = task.id_slot;
 
@@ -5674,31 +5672,30 @@ int main(int argc, char ** argv) {
         // Parse as standard completion parameters
         slot_params params = server_task::params_from_json_cmpl(
             ctx_server.ctx,
-            ctx_server.params,
+            ctx_server.params_base,
             completion_data
         );
 
 
         // Build server_tokens from new prompt
-        server_tokens tokens;
-        if (data.contains("prompt")) {
-            std::string prompt = data["prompt"].get<std::string>();
-            tokens = tokenize_mixed(ctx_server.vocab, {prompt}, true, true);
-        } else {
+        if (!data.contains("prompt")) {
             res_error(res, format_error_response("Missing required field: prompt (new prompt for branch)", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
+        
+        std::string prompt = data["prompt"].get<std::string>();
+        server_tokens tokens = tokenize_mixed(ctx_server.vocab, {prompt}, true, true);
 
 
         // Create branching task
         server_task task(SERVER_TASK_TYPE_BRANCH);
         task.params = params;
-        task.tokens = tokens;
+        task.tokens = std::move(tokens); 
         task.branch = branch;
 
 
         // Queue task
-        ctx_server.queue_tasks.post(task, false);
+        ctx_server.queue_tasks.post(std::move(task), false); 
         
         // Wait for slot assignment (or use async pattern)
         // For simplicity, return branch initiated response
@@ -5724,7 +5721,7 @@ int main(int argc, char ** argv) {
                     {"parent_slot_id", slot.branch.parent_slot_id},
                     {"branch_point", slot.branch.branch_point},
                     {"n_tokens", slot.n_prompt_tokens_processed + slot.n_decoded},
-                    {"state", slot_state_to_str(slot.state)},
+                    {"state", (int)slot.state},
                 });
             }
         }
