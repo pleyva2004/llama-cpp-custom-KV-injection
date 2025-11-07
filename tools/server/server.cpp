@@ -283,7 +283,6 @@ struct branch_params {
 
         BRANCH_MODE_REUSE_KV,       // Reuse KV cache from parent slot
         BRANCH_MODE_FRESH_CONTEXT,  // Fresh context w/ minimal KV cache recalculation
-        BRANCH_MODE_HYBRID,         // Reuse KV for prefix, fresh for branch point   
     
     };
 
@@ -306,7 +305,7 @@ struct branch_params {
             {"token_range_start", token_range_start},
             {"token_range_end", token_range_end},
             {"mode", mode == BRANCH_MODE_REUSE_KV ? "reuse_kv" : 
-                     mode == BRANCH_MODE_FRESH_CONTEXT ? "fresh" : "hybrid"},
+                     mode == BRANCH_MODE_FRESH_CONTEXT ? "fresh": "hybrid"},
             {"text_excerpt", text_excerpt},
             {"use_text_matching", use_text_matching},
             {"context_window", context_window},
@@ -2942,17 +2941,20 @@ struct server_context {
                     slot.prompt.tokens.clear();
 
                     // Copying token IDs from parent to branch
-                    slot.prompt.tokens.insert(
+                    
+                    llama_tokens parent_tokens_subset(
                         parent_slot.token_map.tokens.begin() + start_idx,
                         parent_slot.token_map.tokens.begin() + end_idx
                     );
-
+                    slot.prompt.tokens.insert(parent_tokens_subset);
+                    
                     SLT_DBG(slot, "copied %d tokens from parent to branch\n", end_idx - start_idx);
                 }
 
                 break;
             }
             case branch_params::BRANCH_MODE_FRESH_CONTEXT: {
+
                 /**
                 * FRESH_CONTEXT MODE:
                 * - Clears KV cache for branch sequence
@@ -2960,7 +2962,7 @@ struct server_context {
                 * - Provides isolation from parent context
                 * - Slower but useful for "zooming in" without baggage
                 */
-                SLT_INF(slot, "branching in FRESH_CONTEXT mode\n", "");
+                SLT_INF(slot, "branching in FRESH_CONTEXT mode%s\n", "");
 
                 // Clear any existing KV For this sequence 
                 auto memory = llama_get_memory(ctx);
@@ -5603,16 +5605,15 @@ int main(int argc, char ** argv) {
         
         // Parse branch mode
         std::string mode_str = json_value(data, "branch_mode", std::string("reuse_kv"));
-        if (mode_str == "reuse_kv"){
+        if (mode_str == "reuse_kv" ) {
             branch.mode = branch_params::BRANCH_MODE_REUSE_KV;
-        } else if (mode_str == "fresh"){
+        } else if (mode_str == "fresh") {
             branch.mode = branch_params::BRANCH_MODE_FRESH_CONTEXT;
         } else {
             res_error(res, format_error_response("Invalid mode. Must be: reuse_kv or fresh", ERROR_TYPE_INVALID_REQUEST));
-            return;
+            return;   
         }
-
-
+        
 
         // Token range (if provided)
         if (data.contains("token_range") && data["token_range"].is_array()) {
@@ -5648,7 +5649,7 @@ int main(int argc, char ** argv) {
 
         // Context window (if provided)
         if (data.contains("context_window") && data["context_window"].is_number_integer()) {
-            branch.context_window = json_value(body, "context_window", 0);
+            branch.context_window = json_value(data, "context_window", 0);
         } else {
             res_error(res, format_error_response("Invalid context window. Must be an integer", ERROR_TYPE_INVALID_REQUEST));
             return;
@@ -5684,18 +5685,19 @@ int main(int argc, char ** argv) {
         }
         
         std::string prompt = data["prompt"].get<std::string>();
-        server_tokens tokens = tokenize_mixed(ctx_server.vocab, {prompt}, true, true);
+        llama_tokens tokenized = tokenize_mixed(ctx_server.vocab, {prompt}, true, true);
+        server_tokens tokens(tokenized, false);
 
 
         // Create branching task
         server_task task(SERVER_TASK_TYPE_BRANCH);
         task.params = params;
-        task.tokens = std::move(tokens); 
+        task.tokens = std::move(tokens);
         task.branch = branch;
 
 
         // Queue task
-        ctx_server.queue_tasks.post(std::move(task), false); 
+        ctx_server.queue_tasks.post(std::move(task), false);
         
         // Wait for slot assignment (or use async pattern)
         // For simplicity, return branch initiated response
